@@ -118,7 +118,7 @@ def _compose_template(req: ComposeRequest)->str:
 {offer}
 
 — Kade
-""""
+"""
 
 @app.post('/compose', response_model=ComposeResponse)
 async def compose(req: ComposeRequest):
