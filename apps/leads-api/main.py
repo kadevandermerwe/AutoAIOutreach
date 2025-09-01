@@ -238,17 +238,17 @@ async def search(req: SearchRequest):
 
 
                 if page_token: params['pageToken'] = page_token
-                    r = await http.get('https://www.googleapis.com/youtube/v3/search', params=params)
-                    r.raise_for_status()
-                    data = r.json()
-                    items = data.get('items', [])
-                    if not items: break
-                    video_ids = [it['id']['videoId'] for it in items if it['id'].get('videoId')]
-                    if not video_ids: break
-                    vr = await http.get('https://www.googleapis.com/youtube/v3/videos', params=dict(part='snippet,statistics', id=','.join(video_ids), key=YT_API_KEY))
-                    vr.raise_for_status()
-                    vitems = {it['id']: it for it in vr.json().get('items', [])}
-                    channel_ids = list({ it['snippet']['channelId'] for it in vitems.values() })
+                r = await http.get('https://www.googleapis.com/youtube/v3/search', params=params)
+                r.raise_for_status()
+                data = r.json()
+                items = data.get('items', [])
+                if not items: break
+                video_ids = [it['id']['videoId'] for it in items if it['id'].get('videoId')]
+                if not video_ids: break
+                vr = await http.get('https://www.googleapis.com/youtube/v3/videos', params=dict(part='snippet,statistics', id=','.join(video_ids), key=YT_API_KEY))
+                vr.raise_for_status()
+                vitems = {it['id']: it for it in vr.json().get('items', [])}
+                channel_ids = list({ it['snippet']['channelId'] for it in vitems.values() })
                 if channel_ids:
                     cr = await http.get('https://www.googleapis.com/youtube/v3/channels', params=dict(part='snippet,statistics,brandingSettings', id=','.join(channel_ids), key=YT_API_KEY))
                     cr.raise_for_status()
