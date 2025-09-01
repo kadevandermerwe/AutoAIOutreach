@@ -20,6 +20,34 @@ try:
 except Exception:
     OPENAI_AVAILABLE = False
 
+# --- artist-focused filters (add these) ---
+EXCLUDE_VIDEO = re.compile(
+    r"(?i)\b(type\s*beat|instrumental|mix|playlist|full\s*album|dj\s*mix|karaoke|cover|tribute|sped\s*up|slowed|8d|remaster|remastered|199\d|200\d)\b"
+)
+EXCLUDE_CHANNEL = re.compile(
+    r"(?i)\b(beats?|type\s*beats?|instrumentals?|producer|prod\.?|beatmaker|records|mixtapes?)\b"
+)
+INCLUDE_VIDEO = re.compile(
+    r"(?i)\b(official (audio|video)|visualizer|lyric video|single|performance)\b"
+)
+EXCLUDE_HANDLE = re.compile(r"(?i)(beats|prod|producer)")
+
+# NEW: fan/reupload/fancam filters
+EXCLUDE_REPOST = re.compile(
+    r"(?i)\b(fan[\s-]?cam|fan[\s-]?made|fan[\s-]?edit|edit|re[-\s]?upload|"
+    r"no\s+copyright|i\s+do\s+not\s+own\s+the\s+rights|credits?\s+to)\b"
+)
+
+# NEW: block huge/fandom keywords that skew results toward big acts
+EXCLUDE_BIG_ARTISTS = re.compile(
+    r"(?i)\b(blackpink|bts|stray\s*kids|twice|seventeen|nct|taylor\s*swift|"
+    r"billie\s*eilish|olivia\s*rodrigo|ariana\s*grande|drake|bad\s*bunny|doja\s*cat|eminem|rihanna|dua\s*lipa)\b"
+)
+
+# Skip auto-generated “- Topic” channels
+EXCLUDE_TOPIC_CH = re.compile(r"(?i)\b\-?\s*topic\b")
+
+
 DATABASE_URL = os.getenv('DATABASE_URL')
 ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS','*')
 YT_API_KEY = os.getenv('YT_API_KEY')
@@ -63,15 +91,20 @@ with engine.begin() as cx:
       sent_at TIMESTAMP
     );''')
 
+
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 IG_RE = re.compile(r"https?://(?:www\.)?instagram\.com/[A-Za-z0-9_.]+")
 
 class SearchRequest(BaseModel):
     queries: List[str]
-    days_back: int = 120
+    days_back: int = 90
     min_subs: int = 1000
-    max_subs: int = 250000
+    max_subs: int = 120000  # tighter cap to avoid big-label gravity
     max_results_per_query: int = 60
+    strict_artist_filter: bool = True
+    min_video_views: int = 300
+    exclude_keywords: List[str] = []  # runtime blocklist
+
 
 class Prospect(BaseModel):
     name: str
@@ -201,8 +234,9 @@ async def search(req: SearchRequest):
             page_token = None
             fetched = 0
             while fetched < req.max_results_per_query:
-                params = dict(part='id,snippet', q=q, type='video', order='date', maxResults=50,
-                              publishedAfter=published_after, key=YT_API_KEY)
+                params = dict(part='id,snippet', q=q, type='video', order='date', maxResults=50, publishedAfter=published_after, key=YT_API_KEY, videoDuration='medium')
+
+
                 if page_token: params['pageToken'] = page_token
                 r = await http.get('https://www.googleapis.com/youtube/v3/search', params=params)
                 r.raise_for_status()
@@ -211,7 +245,7 @@ async def search(req: SearchRequest):
                 if not items: break
                 video_ids = [it['id']['videoId'] for it in items if it['id'].get('videoId')]
                 if not video_ids: break
-                vr = await http.get('https://www.googleapis.com/youtube/v3/videos', params=dict(part='snippet', id=','.join(video_ids), key=YT_API_KEY))
+                vr = await http.get('https://www.googleapis.com/youtube/v3/videos', params=dict(part='snippet,statistics', id=','.join(video_ids), key=YT_API_KEY))
                 vr.raise_for_status()
                 vitems = {it['id']: it for it in vr.json().get('items', [])}
                 channel_ids = list({ it['snippet']['channelId'] for it in vitems.values() })
@@ -228,41 +262,84 @@ async def search(req: SearchRequest):
                     ch = citems.get(v['snippet']['channelId'])
                     if not ch: continue
                     subs = int(ch.get('statistics',{}).get('subscriberCount', 0))
-                    if subs < req.min_subs or subs > req.max_subs: continue
-                    ch_desc = (ch['snippet'].get('description','') + '\n' + ch.get('brandingSettings',{}).get('channel',{}).get('description',''))
-                    vd = v['snippet'].get('description','')
-                    email = (EMAIL_RE.findall(vd) or EMAIL_RE.findall(ch_desc) or [None])[0]
-                    ig = (IG_RE.findall(vd) or IG_RE.findall(ch_desc) or [None])[0]
-                    video_url = f"https://www.youtube.com/watch?v={vid}"
-                    channel_url = f"https://www.youtube.com/channel/{v['snippet']['channelId']}"
-                    rec = dict(
-                        id=f"yt_{vid}", name=ch['snippet']['title'], platform='youtube', handle=ch['snippet'].get('customUrl'),
-                        email=email, instagram=ig, subs=subs,
-                        last_video_at=v['snippet']['publishedAt'], video_title=v['snippet']['title'],
-                        video_url=video_url, channel_url=channel_url, query_source=q,
-                        created_at=datetime.datetime.utcnow()
-                    )
-                    out.append(rec)
-                fetched += len(items)
-                page_token = data.get('nextPageToken')
-                if not page_token: break
-    # dedupe by channel_url
-    seen = set(); deduped = []
-    for r in sorted(out, key=lambda x: x['last_video_at'], reverse=True):
-        key = r['channel_url']
-        if key in seen: continue
-        seen.add(key); deduped.append(r)
-    # store
-    with engine.begin() as cx:
-        for r in deduped:
-            cx.execute(text('DELETE FROM prospects WHERE id=:id'), dict(id=r['id']))
-            cols = ','.join(r.keys()); vals = ','.join([f":{k}" for k in r.keys()])
-            cx.execute(text(f'INSERT INTO prospects ({cols}) VALUES ({vals})'), r)
-    # response
-    return [Prospect(
-        name=r['name'], video_title=r['video_title'], video_url=r['video_url'], channel_url=r['channel_url'],
-        subs=r['subs'], email=r['email'], instagram=r['instagram'], last_video_at=r['last_video_at'], query_source=r['query_source']
-    ) for r in deduped]
+                    v_snip = v['snippet']
+                    v_title = v_snip['title']
+                    v_desc  = v_snip.get('description', '') or ''
+                    ch_title = ch['snippet']['title']
+                    ch_desc  = (ch['snippet'].get('description','') + '\n' +
+                                ch.get('brandingSettings',{}).get('channel',{}).get('description',''))
+                    handle   = ch['snippet'].get('customUrl') or ''
+                    subs     = int(ch.get('statistics',{}).get('subscriberCount', 0))
+                    views    = int(v.get('statistics',{}).get('viewCount', 0))
+                    live     = v_snip.get('liveBroadcastContent','none')
+                    published_at = v_snip['publishedAt']
+                    video_url    = f"https://www.youtube.com/watch?v={vid}"
+                    channel_url  = f"https://www.youtube.com/channel/{v_snip['channelId']}"
+                    
+                    # subscriber bounds (tighter)
+                    if subs < req.min_subs or subs > req.max_subs:
+                        continue
+                    
+                    # skip live streams/premieres
+                    if live and live.lower() != 'none':
+                        continue
+                    
+                    # block obvious repost/fandom/big-artist gravity
+                    if EXCLUDE_REPOST.search(v_title) or EXCLUDE_REPOST.search(v_desc) or EXCLUDE_REPOST.search(ch_desc):
+                        continue
+                    if EXCLUDE_BIG_ARTISTS.search(v_title) or EXCLUDE_BIG_ARTISTS.search(ch_title):
+                        continue
+                    
+                    # skip auto-generated “- Topic” channels
+                    if EXCLUDE_TOPIC_CH.search(ch_title):
+                        continue
+                    
+                    # skip producer/labelish channels/handles
+                    if EXCLUDE_CHANNEL.search(ch_title) or EXCLUDE_CHANNEL.search(ch_desc):
+                        continue
+                    if EXCLUDE_HANDLE.search(handle):
+                        continue
+                    
+                    # skip beat/instrumental uploads
+                    if EXCLUDE_VIDEO.search(v_title):
+                        continue
+                    
+                    # prefer artist-y signals
+                    looks_official = bool(INCLUDE_VIDEO.search(v_title))
+                    looks_artist_bio = bool(re.search(r"(?i)\b(artist|singer|songwriter|musician|official)\b", ch_desc))
+                    cat = v_snip.get('categoryId')
+                    if cat and str(cat) != '10':  # Music category
+                        continue
+                    if req.strict_artist_filter and not (looks_official or looks_artist_bio):
+                        continue
+                    
+                    # quality floor
+                    if views < req.min_video_views:
+                        continue
+                    
+                    # runtime keyword blocklist (from request)
+                    if req.exclude_keywords:
+                        joined = f"{v_title}\n{v_desc}\n{ch_title}\n{handle}"
+                        if any(kw.lower() in joined.lower() for kw in req.exclude_keywords):
+                            continue
+                    
+                    # dedupe by channel_url
+                    seen = set(); deduped = []
+                    for r in sorted(out, key=lambda x: x['last_video_at'], reverse=True):
+                        key = r['channel_url']
+                        if key in seen: continue
+                        seen.add(key); deduped.append(r)
+                    # store
+                    with engine.begin() as cx:
+                        for r in deduped:
+                            cx.execute(text('DELETE FROM prospects WHERE id=:id'), dict(id=r['id']))
+                            cols = ','.join(r.keys()); vals = ','.join([f":{k}" for k in r.keys()])
+                            cx.execute(text(f'INSERT INTO prospects ({cols}) VALUES ({vals})'), r)
+                    # response
+                    return [Prospect(
+                        name=r['name'], video_title=r['video_title'], video_url=r['video_url'], channel_url=r['channel_url'],
+                        subs=r['subs'], email=r['email'], instagram=r['instagram'], last_video_at=r['last_video_at'], query_source=r['query_source']
+                    ) for r in deduped]
 
 @app.get('/export.csv')
 async def export_csv():
