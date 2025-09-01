@@ -6,6 +6,15 @@ import os, re, datetime, httpx, csv, io, time, random
 import sqlalchemy as sa
 from sqlalchemy import text
 
+import langid, unicodedata
+
+def is_english_text(*parts: str, min_prob: float = 0.85) -> bool:
+    text = ' '.join([p for p in parts if p])
+    if not text.strip():
+        return True  # empty text: don't falsely block
+    lang, prob = langid.classify(text)
+    return (lang == 'en') and (prob >= min_prob)
+
 # Optional deps
 SENDGRID_AVAILABLE = True
 try:
@@ -243,11 +252,22 @@ async def search(req: SearchRequest):
                 page_token = None
                 fetched = 0
                 while fetched < req.max_results_per_query:
+                    region_codes = getattr(req, 'region_codes', None) or ['GB','US','CA','AU','IE','NZ']
+                    for rc in region_codes:
+                        page_token = None
+                        fetched = 0
+                        while fetched < req.max_results_per_query:
+        # ... use params with this rc ...
+
                     # tighter search to avoid long mixes
                     params = dict(
-                        part='id,snippet', q=q, type='video', order='date', maxResults=50,
-                        publishedAfter=published_after, key=YT_API_KEY, videoDuration='medium'
-                    )
+                    part='id,snippet',
+                    q=q, type='video', order='date', maxResults=50,
+                    publishedAfter=published_after, key=YT_API_KEY,
+                    videoDuration='medium',
+                    relevanceLanguage='en',    # <— bias English
+                    regionCode=rc)
+
                     if page_token:
                         params['pageToken'] = page_token
 
@@ -304,6 +324,9 @@ async def search(req: SearchRequest):
                         # bounds
                         if subs < req.min_subs or subs > req.max_subs:
                             continue
+                        if not is_english_text(v_title, v_desc, ch_title, ch_desc):
+                            continue
+
                         if live and live.lower() != 'none':
                             continue
                         if cat and str(cat) != '10':  # 10 = Music
