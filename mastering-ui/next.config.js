@@ -1,0 +1,2 @@
+const NEXT_PUBLIC_MASTERING_API_URL = process.env.NEXT_PUBLIC_MASTERING_API_URL || '';
+module.exports = { env: { NEXT_PUBLIC_MASTERING_API_URL } };
