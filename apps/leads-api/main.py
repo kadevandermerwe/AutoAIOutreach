@@ -238,17 +238,17 @@ async def search(req: SearchRequest):
 
 
                 if page_token: params['pageToken'] = page_token
-                r = await http.get('https://www.googleapis.com/youtube/v3/search', params=params)
-                r.raise_for_status()
-                data = r.json()
-                items = data.get('items', [])
-                if not items: break
-                video_ids = [it['id']['videoId'] for it in items if it['id'].get('videoId')]
-                if not video_ids: break
-                vr = await http.get('https://www.googleapis.com/youtube/v3/videos', params=dict(part='snippet,statistics', id=','.join(video_ids), key=YT_API_KEY))
-                vr.raise_for_status()
-                vitems = {it['id']: it for it in vr.json().get('items', [])}
-                channel_ids = list({ it['snippet']['channelId'] for it in vitems.values() })
+                    r = await http.get('https://www.googleapis.com/youtube/v3/search', params=params)
+                    r.raise_for_status()
+                    data = r.json()
+                    items = data.get('items', [])
+                    if not items: break
+                    video_ids = [it['id']['videoId'] for it in items if it['id'].get('videoId')]
+                    if not video_ids: break
+                    vr = await http.get('https://www.googleapis.com/youtube/v3/videos', params=dict(part='snippet,statistics', id=','.join(video_ids), key=YT_API_KEY))
+                    vr.raise_for_status()
+                    vitems = {it['id']: it for it in vr.json().get('items', [])}
+                    channel_ids = list({ it['snippet']['channelId'] for it in vitems.values() })
                 if channel_ids:
                     cr = await http.get('https://www.googleapis.com/youtube/v3/channels', params=dict(part='snippet,statistics,brandingSettings', id=','.join(channel_ids), key=YT_API_KEY))
                     cr.raise_for_status()
@@ -324,22 +324,42 @@ async def search(req: SearchRequest):
                             continue
                     
                     # dedupe by channel_url
+                        # dedupe by channel_url and rank by score then recency
                     seen = set(); deduped = []
-                    for r in sorted(out, key=lambda x: x['last_video_at'], reverse=True):
+                    for r in sorted(out, key=lambda x: (x.get('_score', 0), x['last_video_at']), reverse=True):
                         key = r['channel_url']
-                        if key in seen: continue
-                        seen.add(key); deduped.append(r)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        r.pop('_score', None)  # remove transient
+                        deduped.append(r)
+                
                     # store
                     with engine.begin() as cx:
                         for r in deduped:
                             cx.execute(text('DELETE FROM prospects WHERE id=:id'), dict(id=r['id']))
                             cols = ','.join(r.keys()); vals = ','.join([f":{k}" for k in r.keys()])
                             cx.execute(text(f'INSERT INTO prospects ({cols}) VALUES ({vals})'), r)
-                    # response
-                    return [Prospect(
-                        name=r['name'], video_title=r['video_title'], video_url=r['video_url'], channel_url=r['channel_url'],
-                        subs=r['subs'], email=r['email'], instagram=r['instagram'], last_video_at=r['last_video_at'], query_source=r['query_source']
-                    ) for r in deduped]
+                
+                    # >>> DO NOT FORGET TO RETURN A LIST (even if empty)
+                    if not deduped:
+                        return []
+                
+                    return [
+                        Prospect(
+                            name=r['name'],
+                            video_title=r['video_title'],
+                            video_url=r['video_url'],
+                            channel_url=r['channel_url'],
+                            subs=r['subs'],
+                            email=r.get('email'),
+                            instagram=r.get('instagram'),
+                            last_video_at=r.get('last_video_at'),
+                            query_source=r['query_source'],
+                        )
+                        for r in deduped
+                    ]
+
 
 @app.get('/export.csv')
 async def export_csv():
