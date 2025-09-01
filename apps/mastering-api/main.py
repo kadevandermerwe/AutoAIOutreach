@@ -69,9 +69,10 @@ async def create_job(background: BackgroundTasks,
         shutil.copyfileobj(file.file, f)
 
     with engine.begin() as cx:
-        cx.execute(text('INSERT INTO jobs (id,status,created_at,preset,target_lufs,true_peak,input_path,output_path)                          VALUES (:id,:st,:ts,:pr,:lu,:tp,:in,:out)'),
-                   dict(id=jid, st='queued', ts=datetime.datetime.utcnow(), pr=preset,
-                        lu=target_lufs, tp=true_peak, in=in_path, out=out_path))
+        cx.execute(text('INSERT INTO jobs (id,status,created_at,preset,target_lufs,true_peak,input_path,output_path)\
+                  VALUES (:id,:st,:ts,:pr,:lu,:tp,:inp,:outp)'),
+           dict(id=jid, st='queued', ts=datetime.datetime.utcnow(), pr=preset,
+                lu=target_lufs, tp=true_peak, inp=in_path, outp=out_path))
 
     background.add_task(_process_job, jid)
     return CreateJobResponse(id=jid, status='queued')
