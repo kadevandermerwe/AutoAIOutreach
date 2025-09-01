@@ -223,142 +223,181 @@ async def send_email(req: SendEmailRequest):
         raise HTTPException(500, f"Email send failed: {e}")
     return OutboxItem(id=oid, status='sent')
 
+from fastapi import HTTPException
+import datetime, httpx, re
+
 @app.post('/search', response_model=List[Prospect])
 async def search(req: SearchRequest):
     if not YT_API_KEY:
+        # This should be a clean client error, not a 500
         raise HTTPException(400, 'YT_API_KEY not set')
+
     published_after = (datetime.datetime.utcnow() - datetime.timedelta(days=req.days_back)).isoformat('T') + 'Z'
-    out = []
-    async with httpx.AsyncClient(timeout=20) as http:
-        for q in req.queries:
-            page_token = None
-            fetched = 0
-            while fetched < req.max_results_per_query:
-                params = dict(part='id,snippet', q=q, type='video', order='date', maxResults=50, publishedAfter=published_after, key=YT_API_KEY, videoDuration='medium')
+    out: List[dict] = []
 
+    try:
+        async with httpx.AsyncClient(timeout=20) as http:
+            for q in req.queries:
+                if not q.strip():
+                    continue
+                page_token = None
+                fetched = 0
+                while fetched < req.max_results_per_query:
+                    # tighter search to avoid long mixes
+                    params = dict(
+                        part='id,snippet', q=q, type='video', order='date', maxResults=50,
+                        publishedAfter=published_after, key=YT_API_KEY, videoDuration='medium'
+                    )
+                    if page_token:
+                        params['pageToken'] = page_token
 
-                if page_token: params['pageToken'] = page_token
-                r = await http.get('https://www.googleapis.com/youtube/v3/search', params=params)
-                r.raise_for_status()
-                data = r.json()
-                items = data.get('items', [])
-                if not items: break
-                video_ids = [it['id']['videoId'] for it in items if it['id'].get('videoId')]
-                if not video_ids: break
-                vr = await http.get('https://www.googleapis.com/youtube/v3/videos', params=dict(part='snippet,statistics', id=','.join(video_ids), key=YT_API_KEY))
-                vr.raise_for_status()
-                vitems = {it['id']: it for it in vr.json().get('items', [])}
-                channel_ids = list({ it['snippet']['channelId'] for it in vitems.values() })
-                if channel_ids:
-                    cr = await http.get('https://www.googleapis.com/youtube/v3/channels', params=dict(part='snippet,statistics,brandingSettings', id=','.join(channel_ids), key=YT_API_KEY))
-                    cr.raise_for_status()
-                    citems = {it['id']: it for it in cr.json().get('items', [])}
-                else:
+                    r = await http.get('https://www.googleapis.com/youtube/v3/search', params=params)
+                    r.raise_for_status()
+                    data = r.json()
+                    items = data.get('items', [])
+                    if not items:
+                        break
+
+                    video_ids = [it['id'].get('videoId') for it in items if it.get('id') and it['id'].get('videoId')]
+                    if not video_ids:
+                        fetched += len(items)
+                        page_token = data.get('nextPageToken')
+                        if not page_token:
+                            break
+                        continue
+
+                    # need statistics for viewCount
+                    vr = await http.get('https://www.googleapis.com/youtube/v3/videos',
+                        params=dict(part='snippet,statistics', id=','.join(video_ids), key=YT_API_KEY))
+                    vr.raise_for_status()
+                    vitems = {it['id']: it for it in vr.json().get('items', [])}
+
+                    channel_ids = list({ vitems[v]['snippet']['channelId'] for v in vitems })
                     citems = {}
+                    if channel_ids:
+                        cr = await http.get('https://www.googleapis.com/youtube/v3/channels',
+                            params=dict(part='snippet,statistics,brandingSettings', id=','.join(channel_ids), key=YT_API_KEY))
+                        cr.raise_for_status()
+                        citems = {it['id']: it for it in cr.json().get('items', [])}
 
-                for vid in video_ids:
-                    v = vitems.get(vid)
-                    if not v: continue
-                    ch = citems.get(v['snippet']['channelId'])
-                    if not ch: continue
-                    subs = int(ch.get('statistics',{}).get('subscriberCount', 0))
-                    v_snip = v['snippet']
-                    v_title = v_snip['title']
-                    v_desc  = v_snip.get('description', '') or ''
-                    ch_title = ch['snippet']['title']
-                    ch_desc  = (ch['snippet'].get('description','') + '\n' +
-                                ch.get('brandingSettings',{}).get('channel',{}).get('description',''))
-                    handle   = ch['snippet'].get('customUrl') or ''
-                    subs     = int(ch.get('statistics',{}).get('subscriberCount', 0))
-                    views    = int(v.get('statistics',{}).get('viewCount', 0))
-                    live     = v_snip.get('liveBroadcastContent','none')
-                    published_at = v_snip['publishedAt']
-                    video_url    = f"https://www.youtube.com/watch?v={vid}"
-                    channel_url  = f"https://www.youtube.com/channel/{v_snip['channelId']}"
-                    
-                    # subscriber bounds (tighter)
-                    if subs < req.min_subs or subs > req.max_subs:
-                        continue
-                    
-                    # skip live streams/premieres
-                    if live and live.lower() != 'none':
-                        continue
-                    
-                    # block obvious repost/fandom/big-artist gravity
-                    if EXCLUDE_REPOST.search(v_title) or EXCLUDE_REPOST.search(v_desc) or EXCLUDE_REPOST.search(ch_desc):
-                        continue
-                    if EXCLUDE_BIG_ARTISTS.search(v_title) or EXCLUDE_BIG_ARTISTS.search(ch_title):
-                        continue
-                    
-                    # skip auto-generated “- Topic” channels
-                    if EXCLUDE_TOPIC_CH.search(ch_title):
-                        continue
-                    
-                    # skip producer/labelish channels/handles
-                    if EXCLUDE_CHANNEL.search(ch_title) or EXCLUDE_CHANNEL.search(ch_desc):
-                        continue
-                    if EXCLUDE_HANDLE.search(handle):
-                        continue
-                    
-                    # skip beat/instrumental uploads
-                    if EXCLUDE_VIDEO.search(v_title):
-                        continue
-                    
-                    # prefer artist-y signals
-                    looks_official = bool(INCLUDE_VIDEO.search(v_title))
-                    looks_artist_bio = bool(re.search(r"(?i)\b(artist|singer|songwriter|musician|official)\b", ch_desc))
-                    cat = v_snip.get('categoryId')
-                    if cat and str(cat) != '10':  # Music category
-                        continue
-                    if req.strict_artist_filter and not (looks_official or looks_artist_bio):
-                        continue
-                    
-                    # quality floor
-                    if views < req.min_video_views:
-                        continue
-                    
-                    # runtime keyword blocklist (from request)
-                    if req.exclude_keywords:
-                        joined = f"{v_title}\n{v_desc}\n{ch_title}\n{handle}"
-                        if any(kw.lower() in joined.lower() for kw in req.exclude_keywords):
+                    for vid in video_ids:
+                        v = vitems.get(vid)
+                        if not v: 
                             continue
-                    
-                    # dedupe by channel_url
-                        # dedupe by channel_url and rank by score then recency
-                    seen = set(); deduped = []
-                    for r in sorted(out, key=lambda x: (x.get('_score', 0), x['last_video_at']), reverse=True):
-                        key = r['channel_url']
-                        if key in seen:
+                        snip = v['snippet']
+                        ch = citems.get(snip['channelId'])
+                        if not ch:
                             continue
-                        seen.add(key)
-                        r.pop('_score', None)  # remove transient
-                        deduped.append(r)
-                
-                    # store
-                    with engine.begin() as cx:
-                        for r in deduped:
-                            cx.execute(text('DELETE FROM prospects WHERE id=:id'), dict(id=r['id']))
-                            cols = ','.join(r.keys()); vals = ','.join([f":{k}" for k in r.keys()])
-                            cx.execute(text(f'INSERT INTO prospects ({cols}) VALUES ({vals})'), r)
-                
-                    # >>> DO NOT FORGET TO RETURN A LIST (even if empty)
-                    if not deduped:
-                        return []
-                
-                    return [
-                        Prospect(
-                            name=r['name'],
-                            video_title=r['video_title'],
-                            video_url=r['video_url'],
-                            channel_url=r['channel_url'],
-                            subs=r['subs'],
-                            email=r.get('email'),
-                            instagram=r.get('instagram'),
-                            last_video_at=r.get('last_video_at'),
-                            query_source=r['query_source'],
+
+                        # -------- filters (tight) --------
+                        v_title = snip['title']
+                        v_desc  = snip.get('description','') or ''
+                        ch_title = ch['snippet']['title']
+                        ch_desc  = (ch['snippet'].get('description','') + '\n' +
+                                    ch.get('brandingSettings',{}).get('channel',{}).get('description',''))
+                        handle   = ch['snippet'].get('customUrl') or ''
+                        subs     = int(ch.get('statistics',{}).get('subscriberCount', 0))
+                        views    = int(v.get('statistics',{}).get('viewCount', 0))
+                        live     = snip.get('liveBroadcastContent','none')
+                        cat      = snip.get('categoryId')
+
+                        # bounds
+                        if subs < req.min_subs or subs > req.max_subs:
+                            continue
+                        if live and live.lower() != 'none':
+                            continue
+                        if cat and str(cat) != '10':  # 10 = Music
+                            continue
+
+                        # producer / repost / giant-artist filters
+                        if EXCLUDE_CHANNEL.search(ch_title) or EXCLUDE_CHANNEL.search(ch_desc):
+                            continue
+                        if EXCLUDE_HANDLE.search(handle):
+                            continue
+                        if EXCLUDE_VIDEO.search(v_title):
+                            continue
+                        if EXCLUDE_REPOST.search(v_title) or EXCLUDE_REPOST.search(v_desc) or EXCLUDE_REPOST.search(ch_desc):
+                            continue
+                        if EXCLUDE_BIG_ARTISTS.search(v_title) or EXCLUDE_BIG_ARTISTS.search(ch_title):
+                            continue
+                        if EXCLUDE_TOPIC_CH.search(ch_title):
+                            continue
+                        # runtime custom blocklist
+                        if getattr(req, 'exclude_keywords', None):
+                            joined = f"{v_title}\n{v_desc}\n{ch_title}\n{handle}"
+                            if any(kw.lower() in joined.lower() for kw in req.exclude_keywords):
+                                continue
+
+                        looks_official = bool(INCLUDE_VIDEO.search(v_title))
+                        looks_artist_bio = bool(re.search(r"(?i)\b(artist|singer|songwriter|musician|official)\b", ch_desc))
+                        if getattr(req, 'strict_artist_filter', True) and not (looks_official or looks_artist_bio):
+                            continue
+                        if views < getattr(req, 'min_video_views', 300):
+                            continue
+
+                        video_url   = f"https://www.youtube.com/watch?v={vid}"
+                        channel_url = f"https://www.youtube.com/channel/{snip['channelId']}"
+
+                        rec = dict(
+                            id=f"yt_{vid}", name=ch_title, platform='youtube', handle=handle,
+                            email=(EMAIL_RE.findall(v_desc) or EMAIL_RE.findall(ch_desc) or [None])[0],
+                            instagram=(IG_RE.findall(v_desc) or IG_RE.findall(ch_desc) or [None])[0],
+                            subs=subs, last_video_at=snip['publishedAt'], video_title=v_title,
+                            video_url=video_url, channel_url=channel_url, query_source=q,
+                            created_at=datetime.datetime.utcnow(),
+                            _score=(3 if looks_official else 0) + (2 if looks_artist_bio else 0) + (1 if views >= 2000 else 0)
                         )
-                        for r in deduped
-                    ]
+                        out.append(rec)
+
+                    fetched += len(items)
+                    page_token = data.get('nextPageToken')
+                    if not page_token:
+                        break
+
+        # ----- dedupe + sort -----
+        seen, deduped = set(), []
+        for r in sorted(out, key=lambda x: (x.get('_score', 0), x['last_video_at']), reverse=True):
+            k = r['channel_url']
+            if k in seen:
+                continue
+            seen.add(k)
+            r.pop('_score', None)
+            deduped.append(r)
+
+        # store (best-effort; don't fail the response if DB write has an issue)
+        try:
+            with engine.begin() as cx:
+                for r in deduped:
+                    cx.execute(text('DELETE FROM prospects WHERE id=:id'), {'id': r['id']})
+                    cols = ','.join(r.keys())
+                    vals = ','.join([f":{k}" for k in r.keys()])
+                    cx.execute(text(f'INSERT INTO prospects ({cols}) VALUES ({vals})'), r)
+        except Exception as db_err:
+            print('prospect_store_error', repr(db_err))
+
+        # return a LIST (even if empty)
+        return [
+            Prospect(
+                name=r['name'],
+                video_title=r['video_title'],
+                video_url=r['video_url'],
+                channel_url=r['channel_url'],
+                subs=r['subs'],
+                email=r.get('email'),
+                instagram=r.get('instagram'),
+                last_video_at=r.get('last_video_at'),
+                query_source=r['query_source'],
+            )
+            for r in deduped
+        ]
+    except httpx.HTTPStatusError as e:
+        # Bad API key / quota / etc. Return empty list rather than 500 so UI stays usable.
+        print('youtube_http_error', e.response.status_code, e.request.url)
+        return []
+    except Exception as e:
+        # Any other unexpected issue: log and return empty list
+        print('search_unexpected_error', repr(e))
+        return []
 
 
 @app.get('/export.csv')
