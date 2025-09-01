@@ -260,13 +260,13 @@ async def search(req: SearchRequest):
         # ... use params with this rc ...
 
                     # tighter search to avoid long mixes
-                    params = dict(
-                    part='id,snippet',
-                    q=q, type='video', order='date', maxResults=50,
-                    publishedAfter=published_after, key=YT_API_KEY,
-                    videoDuration='medium',
-                    relevanceLanguage='en',    # <— bias English
-                    regionCode=rc)
+                            params = dict(
+                            part='id,snippet',
+                            q=q, type='video', order='date', maxResults=50,
+                            publishedAfter=published_after, key=YT_API_KEY,
+                            videoDuration='medium',
+                            relevanceLanguage='en',    # <— bias English
+                            regionCode=rc)
 
                     if page_token:
                         params['pageToken'] = page_token
